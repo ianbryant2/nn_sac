@@ -2,11 +2,15 @@ from collections import namedtuple, deque
 import random
 from copy import deepcopy
 import os
+import math
 
 import torch
 from torch import nn, optim, tensor, Tensor
-from torch.distributions import MultivariateNormal
+from torch.distributions import Normal, MultivariateNormal
+from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
+
+import numpy as np
 
 import gym
 
@@ -20,6 +24,8 @@ BUFFER_SIZE = 10 ** 6
 SAMPLE_SIZE = 256
 HIDDEN_LAYER_SIZE = 256
 ACTOR_WEIGHT_DECAY = 1e-3 #Found regularization in code
+LOG_STD_MIN = -20
+LOG_STD_MAX = 2
 
 EPS = 1e-6 #So that we do not have a log(0) for the tanh squash of the actor
 
@@ -68,18 +74,6 @@ class BaseNN(nn.Module):
         """Using batchs x should be N x D where N is the number of batches"""
         return self.layers(x)
     
-    def update_parameters(self):
-        """Will update the parameters using the loss and the optim"""
-
-        if self.loss is None:
-            raise ValueError('The loss was not defined')
-        elif self.optim is None:
-            raise ValueError('The optimizer was not created')
-
-        self.optim.zero_grad()
-        self.loss.backward()
-        self.optim.step()
-    
     def save(self, file_name : str='best_weights.pt') -> None:
         """Will save the model in the folder 'model' in the dir that the script was run in."""
 
@@ -108,7 +102,7 @@ class ValueFunction(BaseNN):
 
         self._num_updates = 1 #For logging
 
-    def find_loss(self, trans : Transition) -> None:
+    def update_parameters(self, trans : Transition) -> None:
         """Use equation 5 to find loss"""
 
         with torch.no_grad():
@@ -118,17 +112,23 @@ class ValueFunction(BaseNN):
             #For a regularization term which was included Haarnoja github implementation
             data_s = actions.shape[-1]
             num_batches = actions.shape[0]
+            
             policy_prior = MultivariateNormal(
                 loc=torch.zeros(data_s).unsqueeze(0).repeat(num_batches, 1),
                 covariance_matrix=torch.eye(data_s).unsqueeze(0).repeat(num_batches, 1, 1))
             policy_prior_log_probs = policy_prior.log_prob(actions)
+            
 
             actual_v_value = self._q_func(input_tensor) - log_prob + policy_prior_log_probs
 
-        error : Tensor = (self(trans.state) - actual_v_value) ** 2
-        self.loss = 1/2 * error.mean()
+        error : Tensor = torch.sqrt(1 + (self(trans.state) - actual_v_value) ** 2) - 1
+        loss = error.mean()
 
-        writer.add_scalar('Value loss', self.loss, self._num_updates)
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
+
+        writer.add_scalar('Value loss', loss, self._num_updates)
         self._num_updates += 1
 
 
@@ -145,11 +145,7 @@ class TargetValueFunction:
         self._v_tar = deepcopy(v_func)
         self._v_func = v_func
 
-    def find_loss(self, trans : Transition) -> None:
-        """No loss to find for Target update"""
-        pass
-
-    def update_parameters(self) -> None:
+    def update_parameters(self, trans : Transition) -> None:
         """Update parameters according to algorithim 1"""
         with torch.no_grad():
             for t_param, v_param in zip(self._v_tar.parameters(), self._v_func.parameters()):
@@ -176,17 +172,21 @@ class QModel(BaseNN):
         QModel._next_id += 1
         self._num_updates = 1
 
-    def find_loss(self, trans : Transition) -> None:
+    def update_parameters(self, trans : Transition) -> None:
         """Find loss according to equations 7 and 8"""
 
         with torch.no_grad():
             input_tensor = torch.cat((trans.state, trans.action), dim = 1)
             q_backup = trans.reward + GAMMA  * (1- trans.done) * self._v_func(trans.next_state)
         
-        error : Tensor = (self(input_tensor) - q_backup) ** 2
-        self.loss = 1/2 * error.mean()
+        error : Tensor = torch.sqrt(1 + (self(input_tensor) - q_backup) ** 2) - 1
+        loss = error.mean()
 
-        writer.add_scalar(f'Q function {self._network_id} loss', self.loss, self._num_updates)
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
+
+        writer.add_scalar(f'Q function {self._network_id} loss', loss, self._num_updates)
         self._num_updates += 1
 
     def extra_info(self) -> str:
@@ -206,15 +206,11 @@ class QFunction:
         """x should be the action concatenated to the state"""
         return torch.min(self._q1(x), self._q2(x))
 
-    def find_loss(self, trans : Transition) -> None:
-        """Will find loss of both q models of the q functions"""
-        for q in self._list_q_funcs():
-            q.find_loss(trans)
 
-    def update_parameters(self) -> None:
+    def update_parameters(self, trans : Transition) -> None:
         """Will update the parameters of the q models"""
         for q in self._list_q_funcs():
-            q.update_parameters()
+            q.update_parameters(trans)
 
     def to(self, device) -> None:
         """Will move both of the q models to the device"""
@@ -242,12 +238,7 @@ class Actor(BaseNN):
         self._mean_lin = nn.Linear(self._hidden_size, output_size)
         self._covar_lin = nn.Linear(self._hidden_size, output_size)
 
-        def all_params():
-            yield from self.layers.parameters()
-            yield from self._mean_lin.parameters()
-            yield from self._covar_lin.parameters()
-
-        self.optim = optim.Adam(all_params(), STEP_ACTOR, weight_decay=ACTOR_WEIGHT_DECAY) #weight decay is for l2 regularization which I think the github code uses I am not 100% though
+        self.optim = optim.Adam(self.parameters(), STEP_ACTOR, weight_decay=ACTOR_WEIGHT_DECAY) #weight decay is for l2 regularization which I think the github code uses I am not 100% though
 
         self._num_updates = 0
 
@@ -259,7 +250,7 @@ class Actor(BaseNN):
 
         return self._squash_output(action, dist)
 
-    def find_loss(self, trans : Transition) -> None:
+    def update_parameters(self, trans : Transition) -> None:
         """Finds the loss using equation 12"""
 
         dist = self._dist(trans.state)
@@ -270,36 +261,36 @@ class Actor(BaseNN):
             input_tensor = torch.cat((trans.state, actions), dim=1)
             q_value = self._q_function(input_tensor)
                                    
-        error : Tensor = log_probs - q_value
-        self.loss = error.mean()
+        error : Tensor = (log_probs - q_value)
+        loss = error.mean()
 
-        writer.add_scalar('Actor loss', self.loss, self._num_updates)
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
+
+        writer.add_scalar('Actor loss', loss, self._num_updates)
         self._num_updates += 1
 
-    def _squash_output(self, action : Tensor, dist : MultivariateNormal) -> tuple[Tensor, Tensor]:
+    def _squash_output(self, action : Tensor, dist : Normal) -> tuple[Tensor, Tensor]:
         """Will squash the action and the log_prob with tanh using equation 20
         Can be used on batches or on single values"""
 
         tan_action = torch.tanh(action)
-        log_probs : Tensor = (dist.log_prob(action) - torch.sum(torch.log(1 - torch.tanh(action) ** 2 + EPS), dim = -1)).unsqueeze(-1)
+
+        log_probs = dist.log_prob(action).sum(dim=-1)
+        log_probs -= (2*(math.log(2) - action - F.softplus(2 * action))).sum(dim=-1)
 
         return tan_action, log_probs
-
-    def _dist(self, x : Tensor) -> MultivariateNormal:
+    
+    def _dist(self, x : Tensor) -> Normal:
         """Will create a distribution for either a single or batch of a state """
 
         mean = self._mean_lin(self.layers(x))
-        covar = self._covar_lin(self.layers(x))
-        covar = torch.clamp(covar, EPS, 1)
-    
-        if len(covar.shape) == 2: #When dealing with batches
-            covar_m = torch.diag(covar[0]).unsqueeze(dim = 0)
-            for cv in covar[1:]:
-                covar_m = torch.cat((covar_m, torch.diag(cv).unsqueeze(dim = 0)), dim = 0)
-        else:
-            covar_m = torch.diag(covar)
+        std = self._covar_lin(self.layers(x))
+        std = torch.clamp(std, LOG_STD_MIN, LOG_STD_MAX)
+        std = torch.exp(std)
 
-        return MultivariateNormal(mean, covar_m)
+        return Normal(mean, std)
 
 
 class MemoryBuffer:
@@ -371,8 +362,7 @@ def train(gm : gym.Env, len_state : int , len_output : int, * , reward_scale : f
     actor.to(_DEVICE)
     v_func.to(_DEVICE)
 
-    #list_networks = [q_func, actor]
-    list_networks = [v_func, q_func, actor, target_v] #This list should be used if training actor
+    list_networks = [v_func, q_func, actor, target_v] 
     
     replay_buffer = MemoryBuffer()
     num_games = 0
@@ -384,6 +374,33 @@ def train(gm : gym.Env, len_state : int , len_output : int, * , reward_scale : f
     total_return = 0
 
     try:
+        
+        #Fill buffer with random actions
+        for _ in range(SAMPLE_SIZE * 10):
+            action = 2 * torch.rand(len_output, device=_DEVICE, dtype=torch.float32) - 1
+            unscaled_action = unscale_action(gm.action_space, action.clone().detach().cpu().numpy())
+            next_state, reward, terminated, truncated, _ = gm.step(unscaled_action)
+            next_action = action
+
+            trans = Transition(
+                tensor(state, device=_DEVICE, dtype=torch.float32),
+                action,
+                tensor(next_state, device=_DEVICE, dtype=torch.float32),
+                next_action,
+                tensor([reward], device=_DEVICE, dtype=torch.float32),
+                tensor([terminated], device=_DEVICE, dtype=torch.float32)              
+            )
+
+            replay_buffer.add_data(trans)
+
+            if terminated or truncated:
+                next_state = gm.reset()[0]
+
+            state = next_state
+
+        state = torch.from_numpy(state)
+
+
         while (max_game is None or max_game > num_games) and (max_steps is None or max_steps > episodes):
             unscaled_action = unscale_action(gm.action_space, action.clone().detach().cpu().numpy())
             next_state, reward, terminated, truncated, _ = gm.step(unscaled_action)
@@ -399,7 +416,7 @@ def train(gm : gym.Env, len_state : int , len_output : int, * , reward_scale : f
                 tensor(next_state, device=_DEVICE, dtype=torch.float32),
                 next_action,
                 tensor([reward], device=_DEVICE, dtype=torch.float32),
-                tensor([done], device=_DEVICE, dtype=torch.float32)
+                tensor([terminated], device=_DEVICE, dtype=torch.float32)
             )
 
             replay_buffer.add_data(trans)
@@ -407,10 +424,7 @@ def train(gm : gym.Env, len_state : int , len_output : int, * , reward_scale : f
             batch = replay_buffer.sample()
 
             for net in list_networks:
-                net.find_loss(batch)
-
-            for net in list_networks:
-                net.update_parameters()
+                net.update_parameters(batch)
 
             episodes += 1
 
@@ -436,5 +450,5 @@ def train(gm : gym.Env, len_state : int , len_output : int, * , reward_scale : f
 
 if __name__ == '__main__':
     env = gym.make('Hopper-v4', render_mode = 'human')
-    train(env, 11, 3, reward_scale=5.0)
+    train(env, 11, 3, reward_scale=2)
     
