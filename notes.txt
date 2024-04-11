@@ -1,0 +1,3 @@
+This implementation only works with actions with bounds [-1, 1].
+If want to be used in other environments the action needs to be scaled.
+The hyperparameters do not entirely match up and most likely need to change.
