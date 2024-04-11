@@ -2,30 +2,28 @@ from collections import namedtuple, deque
 import random
 from copy import deepcopy
 import os
-import math
+from pathlib import Path
 
 import torch
 from torch import nn, optim, tensor, Tensor
-from torch.distributions import Normal, MultivariateNormal
+from torch.distributions import Normal
 from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-import numpy as np
-
 import gym
 
-LR = 3 * (10 ** -4)
-STEP_V = LR
-STEP_Q = LR
+LR = 3e-4
+STEP_V = LR#1e-3
+STEP_Q = LR#1e-3
 STEP_ACTOR = LR
 TAU = .005
 GAMMA = .99
 BUFFER_SIZE = 10 ** 6
 SAMPLE_SIZE = 256
 HIDDEN_LAYER_SIZE = 256
-ACTOR_WEIGHT_DECAY = 1e-3 #Found regularization in code
-LOG_STD_MIN = -20
+LOG_STD_MIN = -5
 LOG_STD_MAX = 2
+LEARNING_STEPS = 0
 
 EPS = 1e-6 #So that we do not have a log(0) for the tanh squash of the actor
 
@@ -33,7 +31,6 @@ Transition = namedtuple('Transition',
                         ['state', 
                          'action', 
                          'next_state', 
-                         'next_action', 
                          'reward', 
                          'done']) #If bad performance just switch to a tensor
 
@@ -66,9 +63,6 @@ class BaseNN(nn.Module):
                                 nn.Linear(self._hidden_size, self._hidden_size),
                                 nn.ReLU(),
                                 nn.Linear(self._hidden_size, self.output_size))
-        
-        self.loss : Tensor = None
-        self.optim : optim.Optimizer = None
 
     def forward(self, x : Tensor) -> Tensor:
         """Using batchs x should be N x D where N is the number of batches"""
@@ -79,83 +73,17 @@ class BaseNN(nn.Module):
 
         folder_name = type(self).__name__ + self.extra_info()
 
-        model_folder_path = './model/' + folder_name
+        model_folder_path = Path('./model/' + folder_name)
+        file_dir = Path(os.path.join(model_folder_path, file_name))
 
-        if not os.path.exists(model_folder_path):
-            os.makedirs(model_folder_path)
-        file_dir = os.path.join(model_folder_path, file_name)
+        if not os.path.exists(file_dir.parent):
+            os.makedirs(file_dir.parent)
 
         torch.save(self.state_dict(), file_dir)
 
     def extra_info(self) -> str:
         """Returns any extra information that describes the current NN"""
         return ''
-    
-
-class ValueFunction(BaseNN):
-
-    def __init__(self, *args, q_function : 'QFunction', actor : 'Actor') -> None:
-        super().__init__(*args)
-        self.optim = optim.Adam(self.parameters(), STEP_V)
-        self._actor = actor
-        self._q_func = q_function
-
-        self._num_updates = 1 #For logging
-
-    def update_parameters(self, trans : Transition) -> None:
-        """Use equation 5 to find loss"""
-
-        with torch.no_grad():
-            actions, log_prob = self._actor(trans.state)
-            input_tensor = torch.cat((trans.state, actions), dim = 1)
-
-            #For a regularization term which was included Haarnoja github implementation
-            data_s = actions.shape[-1]
-            num_batches = actions.shape[0]
-            
-            policy_prior = MultivariateNormal(
-                loc=torch.zeros(data_s).unsqueeze(0).repeat(num_batches, 1),
-                covariance_matrix=torch.eye(data_s).unsqueeze(0).repeat(num_batches, 1, 1))
-            policy_prior_log_probs = policy_prior.log_prob(actions)
-            
-
-            actual_v_value = self._q_func(input_tensor) - log_prob + policy_prior_log_probs
-
-        error : Tensor = torch.sqrt(1 + (self(trans.state) - actual_v_value) ** 2) - 1
-        loss = error.mean()
-
-        self.optim.zero_grad()
-        loss.backward()
-        self.optim.step()
-
-        writer.add_scalar('Value loss', loss, self._num_updates)
-        self._num_updates += 1
-
-
-
-class TargetValueFunction:
-    """Target target value function that contains method to update parameters not using gradient according to pseudocode"""
-
-    def __init__(self) -> None:
-        self._v_tar = None
-        self._v_func = None
-
-    def upload_v_func(self, v_func : ValueFunction) -> None:
-        """Uploads the v function after the target is made"""
-        self._v_tar = deepcopy(v_func)
-        self._v_func = v_func
-
-    def update_parameters(self, trans : Transition) -> None:
-        """Update parameters according to algorithim 1"""
-        with torch.no_grad():
-            for t_param, v_param in zip(self._v_tar.parameters(), self._v_func.parameters()):
-                new_value = TAU * v_param + (1 - TAU) * t_param
-                t_param.copy_(new_value)
-
-
-    def __call__(self, state : Tensor) -> Tensor:
-        return self._v_tar(state)
-
 
 class QModel(BaseNN):
     """Will be the model representing a q function.
@@ -163,54 +91,61 @@ class QModel(BaseNN):
 
     _next_id = 1
 
-    def __init__(self, *args, target_v_func : TargetValueFunction) -> None:
+    def __init__(self, *args) -> None:
         super().__init__(*args)
-        self._v_func = target_v_func
-        self.optim = optim.Adam(self.parameters(), STEP_Q)
-
+        self._optim = optim.Adam(self.parameters(), STEP_Q)
         self._network_id = QModel._next_id
         QModel._next_id += 1
         self._num_updates = 1
 
-    def update_parameters(self, trans : Transition) -> None:
+    def update(self, loss : Tensor, num_games : int) -> None:
         """Find loss according to equations 7 and 8"""
 
-        with torch.no_grad():
-            input_tensor = torch.cat((trans.state, trans.action), dim = 1)
-            q_backup = trans.reward + GAMMA  * (1- trans.done) * self._v_func(trans.next_state)
-        
-        error : Tensor = torch.sqrt(1 + (self(input_tensor) - q_backup) ** 2) - 1
-        loss = error.mean()
-
-        self.optim.zero_grad()
+        self._optim.zero_grad()
         loss.backward()
-        self.optim.step()
+        self._optim.step()
 
-        writer.add_scalar(f'Q function {self._network_id} loss', loss, self._num_updates)
+        writer.add_scalar(f'Q function {self._network_id} loss', loss, num_games)
         self._num_updates += 1
 
     def extra_info(self) -> str:
         return str(self._network_id)
 
-
-
-
 class QFunction:
     """Will contain two q models that will be used as a single q function."""
 
-    def __init__(self, q1 : QModel,  q2 :  QModel) -> None:
+    def __init__(self, q1 : QModel,  q2 :  QModel, *, alpha : float) -> None:
         self._q1 = q1
         self._q2 = q2
+        self._alpha = alpha
 
     def __call__(self, x : Tensor) -> Tensor:
         """x should be the action concatenated to the state"""
         return torch.min(self._q1(x), self._q2(x))
 
-
-    def update_parameters(self, trans : Transition) -> None:
+    def update_parameters(self, trans : Transition, num_games : int) -> None:
         """Will update the parameters of the q models"""
-        for q in self._list_q_funcs():
-            q.update_parameters(trans)
+        with torch.no_grad():
+            input_tensor = torch.cat((trans.state, trans.action), dim=-1)
+
+        q1 = self._q1(input_tensor)
+        q2 = self._q2(input_tensor)
+
+        #Find backup
+        with torch.no_grad():
+            new_action, new_log = self._actor(trans.next_state)
+            new_in_tensor = torch.cat((trans.next_state, new_action), dim=-1)
+            new_q = self(new_in_tensor)
+            new_value =  new_q - self._alpha * new_log
+            q_back = trans.reward + (1-trans.done) * GAMMA * new_value
+
+
+        self._q1.update((1/2 * ((q1 - q_back) ** 2)).mean(), num_games)
+        self._q2.update((1/2 * ((q2 - q_back) ** 2)).mean(), num_games)
+
+    def upload_actor(self, actor : 'Actor') -> None:
+        """Will upload the actor to the QFunction"""
+        self._actor = actor
 
     def to(self, device) -> None:
         """Will move both of the q models to the device"""
@@ -222,13 +157,22 @@ class QFunction:
         for model in self._list_q_funcs():
             model.save(file_name)
 
+    def update_target(self, actual : 'QFunction') -> None:
+        """Uses the actual to update self when self is a target"""
+        with torch.no_grad():
+            for param, target_param in zip(actual._q1.parameters(), self._q1.parameters()):
+                target_param.copy_(TAU * param.data + (1 - TAU) * target_param.data)
+
+            for param, target_param in zip(actual._q2.parameters(), self._q2.parameters()):
+                target_param.copy_(TAU * param.data + (1 - TAU) * target_param.data)
+
     def _list_q_funcs(self) -> list[QModel]:
         return [self._q1, self._q2]
 
 
 class Actor(BaseNN):
 
-    def __init__(self, input_size : int, output_size : int, *, q_function : QFunction) -> None:
+    def __init__(self, input_size : int, output_size : int, *, q_function : QFunction, alpha : float) -> None:
         super().__init__(input_size, output_size)
         self._q_function = q_function
 
@@ -237,8 +181,11 @@ class Actor(BaseNN):
         self.layers = self.layers[:-1]
         self._mean_lin = nn.Linear(self._hidden_size, output_size)
         self._covar_lin = nn.Linear(self._hidden_size, output_size)
+        self._alpha = alpha
 
-        self.optim = optim.Adam(self.parameters(), STEP_ACTOR, weight_decay=ACTOR_WEIGHT_DECAY) #weight decay is for l2 regularization which I think the github code uses I am not 100% though
+        self.optim = optim.Adam(self.parameters(), STEP_ACTOR) #, weight_decay=ACTOR_WEIGHT_DECAY) #weight decay is for l2 regularization which I think the github code uses I am not 100% though
+        
+        self._log2 = torch.log(tensor(2, device=_DEVICE, dtype=torch.float32))
 
         self._num_updates = 0
 
@@ -246,29 +193,25 @@ class Actor(BaseNN):
         """Will reuturn a tensor that represents the action for a single or batch of a state"""
         
         dist = self._dist(x)
-        action = dist.sample()
+        action = dist.rsample()
 
         return self._squash_output(action, dist)
 
-    def update_parameters(self, trans : Transition) -> None:
+    def update_parameters(self, trans : Transition, num_games : int) -> None:
         """Finds the loss using equation 12"""
+        actions, log_probs = self(trans.state)
 
-        dist = self._dist(trans.state)
-        actions = dist.rsample() #Will do the reparamaterization trick for us
-        actions, log_probs = self._squash_output(actions, dist)
-
-        with torch.no_grad():
-            input_tensor = torch.cat((trans.state, actions), dim=1)
-            q_value = self._q_function(input_tensor)
+        input_tensor = torch.cat((trans.state, actions), dim=-1)
+        q_value = self._q_function(input_tensor)
                                    
-        error : Tensor = (log_probs - q_value)
+        error : Tensor = (self._alpha * log_probs - q_value)
         loss = error.mean()
 
         self.optim.zero_grad()
         loss.backward()
         self.optim.step()
 
-        writer.add_scalar('Actor loss', loss, self._num_updates)
+        writer.add_scalar('Actor loss', loss, num_games)
         self._num_updates += 1
 
     def _squash_output(self, action : Tensor, dist : Normal) -> tuple[Tensor, Tensor]:
@@ -278,15 +221,16 @@ class Actor(BaseNN):
         tan_action = torch.tanh(action)
 
         log_probs = dist.log_prob(action).sum(dim=-1)
-        log_probs -= (2*(math.log(2) - action - F.softplus(2 * action))).sum(dim=-1)
+        log_probs -= (2*(self._log2 - action - F.softplus(-2 * action))).sum(dim=-1)
 
-        return tan_action, log_probs
+        return tan_action, log_probs.unsqueeze(dim=-1)
     
     def _dist(self, x : Tensor) -> Normal:
         """Will create a distribution for either a single or batch of a state """
-
-        mean = self._mean_lin(self.layers(x))
-        std = self._covar_lin(self.layers(x))
+        
+        net_out = self.layers(x)
+        mean = self._mean_lin(net_out)
+        std = self._covar_lin(net_out)
         std = torch.clamp(std, LOG_STD_MIN, LOG_STD_MAX)
         std = torch.exp(std)
 
@@ -304,11 +248,10 @@ class MemoryBuffer:
         else:
             sample = random.sample(self._memory, SAMPLE_SIZE)
 
-        state, action, next_state, next_action, reward, done = zip(*sample) #unpack list and create tuples of each data point in transition
+        state, action, next_state, reward, done = zip(*sample) #unpack list and create tuples of each data point in transition
         return Transition(state = torch.stack(state, dim = 0), #Each element of transition is the batch of values
                           action = torch.stack(action, dim = 0),
                           next_state = torch.stack(next_state, dim = 0),
-                          next_action = torch.stack(next_action, dim = 0),
                           reward = torch.stack(reward, dim = 0),
                           done = torch.stack(done, dim = 0))
     
@@ -316,133 +259,91 @@ class MemoryBuffer:
         """Will add the data from the single transition into the buffer"""
         self._memory.append(trans)
 
-#Scaling was used from stable_baselines
-def scale_action(action_space, action):
-    """
-    Rescale the action from [low, high] to [-1, 1]
-    (no need for symmetric action space)
-
-    :param action_space: (gym.spaces.box.Box)
-    :param action: (np.ndarray)
-    :return: (np.ndarray)
-    """
-    low, high = action_space.low, action_space.high
-    return 2.0 * ((action - low) / (high - low)) - 1.0
-
-
-def unscale_action(action_space, scaled_action):
-    """
-    Rescale the action from [-1, 1] to [low, high]
-    (no need for symmetric action space)
-
-    :param action_space: (gym.spaces.box.Box)
-    :param action: (np.ndarray)
-    :return: (np.ndarray)
-    """
-    low, high = action_space.low, action_space.high
-    return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
 def train(gm : gym.Env, len_state : int , len_output : int, * , reward_scale : float, max_game : int=None, max_steps : int=None, extra_save_info : str=None, log_dir :str=None) -> None:
     """Will train an agent with a continuous state space of dimensionality len_input and
     a continuous action space of dimensionality of len_output. It will train indefinitely until there
     is an exception (KeyboardInterrupt) or when the agent has been trained for a defined amount of max_game"""
-
-    global writer #Should be fixed later
-    writer = SummaryWriter(log_dir=log_dir) 
+    global writer
+    if log_dir is not None:
+        new_log_dir = f'runs/{log_dir}/run{extra_save_info}'
+    else:
+        new_log_dir = None     
+    writer = SummaryWriter(log_dir=new_log_dir) 
 
     #Initialize all networks
-    target_v = TargetValueFunction()
-    q_func = QFunction(QModel(len_state + len_output, 1, target_v_func=target_v),
-                       QModel(len_state + len_output, 1, target_v_func=target_v))
-    actor = Actor(len_state, len_output, q_function=q_func)
-    v_func = ValueFunction(len_state, 1, q_function=q_func, actor=actor)
-    target_v.upload_v_func(v_func)
+    q_func = QFunction(QModel(len_state + len_output, 1),
+                       QModel(len_state + len_output, 1),
+                       alpha=1 / reward_scale)
+    target_q_func = deepcopy(q_func)
+    actor = Actor(len_state, len_output, q_function=target_q_func, alpha= 1 / reward_scale)
+    q_func.upload_actor(actor)
 
     q_func.to(_DEVICE)
     actor.to(_DEVICE)
-    v_func.to(_DEVICE)
-
-    list_networks = [v_func, q_func, actor, target_v] 
     
     replay_buffer = MemoryBuffer()
     num_games = 0
-    episodes = 0
+    steps = 0
 
-    state = gm.reset()[0]
-    action, _ = actor(tensor(state, device=_DEVICE, dtype=torch.float32)) #can use random action torch.FloatTensor(1).uniform_(-2.0, 2.0)
-
+    state = tensor(gm.reset()[0], device=_DEVICE, dtype=torch.float32)
     total_return = 0
+    episodic_reward = 0
+
+    def get_action(s : Tensor) -> tuple[Tensor, Tensor]:
+        if LEARNING_STEPS < steps:
+            return actor(s)
+        else:
+            return 2 * torch.rand(3) - 1, None
 
     try:
-        
-        #Fill buffer with random actions
-        for _ in range(SAMPLE_SIZE * 10):
-            action = 2 * torch.rand(len_output, device=_DEVICE, dtype=torch.float32) - 1
-            unscaled_action = unscale_action(gm.action_space, action.clone().detach().cpu().numpy())
-            next_state, reward, terminated, truncated, _ = gm.step(unscaled_action)
-            next_action = action
-
-            trans = Transition(
-                tensor(state, device=_DEVICE, dtype=torch.float32),
-                action,
-                tensor(next_state, device=_DEVICE, dtype=torch.float32),
-                next_action,
-                tensor([reward], device=_DEVICE, dtype=torch.float32),
-                tensor([terminated], device=_DEVICE, dtype=torch.float32)              
-            )
-
-            replay_buffer.add_data(trans)
-
-            if terminated or truncated:
-                next_state = gm.reset()[0]
-
-            state = next_state
-
-        state = torch.from_numpy(state)
-
-
-        while (max_game is None or max_game > num_games) and (max_steps is None or max_steps > episodes):
-            unscaled_action = unscale_action(gm.action_space, action.clone().detach().cpu().numpy())
-            next_state, reward, terminated, truncated, _ = gm.step(unscaled_action)
+        while (max_game is None or max_game > num_games) and (max_steps is None or max_steps > steps):
+            action, _ = get_action(state)
+            next_state, reward, terminated, truncated, _ = gm.step(action.clone().detach().cpu().numpy())
             done = terminated or truncated
             total_return += reward
-            reward *= reward_scale
+            episodic_reward += reward
             next_state = tensor(next_state, device=_DEVICE, dtype=torch.float32)
-            next_action, _ = actor(next_state)
-
             trans = Transition( #states will be np arrays, actions will be tensors, the reward will be a float, and done will be a bool
-                tensor(state, device=_DEVICE, dtype=torch.float32),
+                state,
                 action,
-                tensor(next_state, device=_DEVICE, dtype=torch.float32),
-                next_action,
+                next_state,
                 tensor([reward], device=_DEVICE, dtype=torch.float32),
                 tensor([terminated], device=_DEVICE, dtype=torch.float32)
             )
 
             replay_buffer.add_data(trans)
             
-            batch = replay_buffer.sample()
+            if LEARNING_STEPS < steps:
+                batch = replay_buffer.sample()
 
-            for net in list_networks:
-                net.update_parameters(batch)
+                q_func.update_parameters(batch, steps)
+                
+                if num_games % 2:
+                    actor.update_parameters(batch, steps)
 
-            episodes += 1
+                target_q_func.update_target(q_func)
+
+            steps += 1
 
             if done:
-                next_state = gm.reset()[0]
-                next_action, _ = actor(tensor(next_state, device=_DEVICE, dtype=torch.float32)) #can use random action torch.FloatTensor(1).uniform_(-2.0, 2.0)
+                next_state = tensor(gm.reset()[0], device=_DEVICE, dtype=torch.float32)
                 num_games += 1
                 average_return = total_return / num_games
-                writer.add_scalar('Average return', average_return, episodes)
+                writer.add_scalar('Average return', average_return, steps)
+                writer.add_scalar('Episodic rerurn', episodic_reward, steps)
+                episodic_reward = 0
             
             state = next_state
-            action = next_action
     finally:
 
-        file_name = 'best_weights'
+        if log_dir is not None:
+            file_name = Path(f'{log_dir}/best_weights')
+        else:
+            file_name = Path('best_weights')
         if extra_save_info is not None:
-            file_name += extra_save_info
-        file_name += '.pt'
+            file_name = Path(str(file_name) + extra_save_info)
+        file_name = Path(str(file_name) + '.pt')
 
         actor.save(file_name)
         gm.close()
@@ -450,5 +351,5 @@ def train(gm : gym.Env, len_state : int , len_output : int, * , reward_scale : f
 
 if __name__ == '__main__':
     env = gym.make('Hopper-v4', render_mode = 'human')
-    train(env, 11, 3, reward_scale=2)
+    train(env, 11, 3, reward_scale=5, log_dir='runs/test')
     
