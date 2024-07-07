@@ -135,7 +135,7 @@ class QFunction:
         with torch.no_grad():
             new_action, new_log = self._actor(trans.next_state)
             new_in_tensor = torch.cat((trans.next_state, new_action), dim=-1)
-            new_q = self(new_in_tensor)
+            new_q = self._target(new_in_tensor)
             new_value =  new_q - self._alpha * new_log
             q_back = trans.reward + (1-trans.done) * GAMMA * new_value
 
@@ -146,6 +146,9 @@ class QFunction:
     def upload_actor(self, actor : 'Actor') -> None:
         """Will upload the actor to the QFunction"""
         self._actor = actor
+        
+    def upload_target(self, target_q_func : 'QFunction'):
+        self._target = target_q_func
 
     def to(self, device) -> None:
         """Will move both of the q models to the device"""
@@ -278,6 +281,7 @@ def train(gm : gym.Env, len_state : int , len_output : int, * , reward_scale : f
     target_q_func = deepcopy(q_func)
     actor = Actor(len_state, len_output, q_function=target_q_func, alpha= 1 / reward_scale)
     q_func.upload_actor(actor)
+    q_func.upload_target(target_q_func)
 
     q_func.to(_DEVICE)
     actor.to(_DEVICE)
